@@ -140,6 +140,8 @@ a{color:var(--teal);}
   border:2px solid var(--bg);
 }
 .bell-badge.hidden{ display:none; }
+.spin{ animation:spin 0.8s linear infinite; }
+@keyframes spin{ to{ transform:rotate(360deg); } }
 
 .tabs{
   display:flex; overflow-x:auto; gap:8px; padding:10px 14px; border-bottom:1px solid var(--border);
@@ -348,6 +350,9 @@ tr:last-child td{ border-bottom:none; }
         <div class="role" id="topbarRole">—</div>
       </div>
     </div>
+    <button class="icon-btn" id="forceSyncBtn" aria-label="مزامنة فورية" title="مزامنة فورية">
+      <svg id="syncIcon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 0 1-15.3 6.4L3 15"/><path d="M3 12a9 9 0 0 1 15.3-6.4L21 9"/><path d="M3 21v-6h6"/><path d="M21 3v6h-6"/></svg>
+    </button>
     <div class="bell-wrap">
       <button class="icon-btn" id="bellBtn" aria-label="الإشعارات">
         <svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
@@ -393,6 +398,11 @@ tr:last-child td{ border-bottom:none; }
       <input type="file" id="excelFile" accept=".xlsx,.xls,.csv" style="display:none;">
       <button class="btn btn-outline btn-block" id="excelPickBtn">اختيار ملف Excel</button>
       <div id="excelStatus" style="margin-top:10px; font-size:13px; color:var(--teal);"></div>
+    </div>
+    <div class="section-title">تحميل شيت المنتجات الحالي (Excel)</div>
+    <div class="pcard">
+      <p style="color:var(--muted); font-size:13px; margin-top:0;">يصدّر كل المنتجات والدفعات (سطر لكل دفعة) بنفس أعمدة الاستيراد، جاهز للمراجعة أو الجرد.</p>
+      <button class="btn btn-ghost btn-block" id="exportExcelBtn">تصدير كل المنتجات إلى Excel</button>
     </div>
     <div class="section-title">تصدير سجل الأسعار الحالي (PDF)</div>
     <div class="pcard">
@@ -640,6 +650,36 @@ function flushQueue(){
   updateOfflineBanner();
   toast('تمت مزامنة البيانات بنجاح ✔');
 }
+function forceSync(){
+  const icon = document.getElementById('syncIcon');
+  icon.classList.add('spin');
+  if(!fbEnabled){
+    setTimeout(()=> icon.classList.remove('spin'), 600);
+    toast('لم يتم إعداد Firebase بعد — راجع FIREBASE_CONFIG أعلى الكود');
+    return;
+  }
+  if(!navigator.onLine){
+    setTimeout(()=> icon.classList.remove('spin'), 600);
+    toast('لا يوجد اتصال بالإنترنت حالياً');
+    return;
+  }
+  flushQueue();
+  Promise.all([
+    fbDb.ref('products').once('value'),
+    fbDb.ref('promos').once('value'),
+    fbDb.ref('devices').once('value')
+  ]).then(([pSnap, prSnap, dSnap])=>{
+    state.products = pSnap.val() || {};
+    state.promos = prSnap.val() || {};
+    state.devices = dSnap.val() || {};
+    saveLS(LS.products, state.products); saveLS(LS.promos, state.promos); saveLS(LS.devices, state.devices);
+    renderAll();
+    toast('تمت المزامنة الفورية بنجاح ✔');
+  }).catch(()=> toast('تعذرت المزامنة — حاول مجدداً')
+  ).finally(()=> icon.classList.remove('spin'));
+}
+document.getElementById('forceSyncBtn').addEventListener('click', forceSync);
+
 window.addEventListener('online', ()=>{ updateOfflineBanner(); flushQueue(); });
 window.addEventListener('offline', updateOfflineBanner);
 function updateOfflineBanner(){
@@ -699,7 +739,21 @@ function doLogin(){
   session = { username: match.username, role: match.role };
   saveLS(LS.session, session);
   logDeviceLogin(session);
+  prewarmCamera();
   enterApp();
+}
+
+async function prewarmCamera(){
+  // Requests camera access once at login so the browser's permission prompt is
+  // handled up front — scanning later during a shift starts instantly with no popup.
+  try{
+    if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    stream.getTracks().forEach(t => t.stop());
+  }catch(e){
+    // Permission denied or no camera — scanning will just prompt again when actually used.
+    console.info('Camera pre-warm skipped:', e.message);
+  }
 }
 
 function logDeviceLogin(sess){
@@ -1159,6 +1213,31 @@ function normalizeExcelDate(v){
   return '';
 }
 
+/* ================================ BULK EXCEL EXPORT ================================ */
+document.getElementById('exportExcelBtn').addEventListener('click', ()=>{
+  const rows = [];
+  Object.values(state.products).forEach(p=>{
+    const batches = Object.values(p.batches||{});
+    if(batches.length === 0){
+      rows.push({ barcode:p.barcode||'', name:p.name||'', category:p.category||'', price:p.price||0, warehouseQty:0, hallQty:0, prodDate:'', expDate:'' });
+    } else {
+      batches.forEach(b=>{
+        rows.push({
+          barcode:p.barcode||'', name:p.name||'', category:p.category||'', price:p.price||0,
+          warehouseQty:Number(b.warehouseQty)||0, hallQty:Number(b.hallQty)||0,
+          prodDate:b.prodDate||'', expDate:b.expDate||''
+        });
+      });
+    }
+  });
+  if(rows.length === 0){ toast('لا توجد منتجات لتصديرها'); return; }
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Products');
+  XLSX.writeFile(wb, `kazyon-products-${new Date().toISOString().slice(0,10)}.xlsx`);
+  toast('تم تصدير الملف بنجاح ✔');
+});
+
 /* ================================ PDF EXPORT ================================ */
 document.getElementById('exportPdfBtn').addEventListener('click', ()=>{
   const { jsPDF } = window.jspdf;
@@ -1206,6 +1285,7 @@ function boot(){
   setInterval(renderNotifBadge, 60000);
   if(session && session.username){
     enterApp();
+    prewarmCamera();
   }
 }
 boot();
